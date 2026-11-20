@@ -1,0 +1,309 @@
+import argparse
+import sys
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import librosa
+import numpy as np
+import torch
+import torchaudio
+
+from config import TrainConfig
+from inference.checkpoint import find_ckpt, load_unet
+from inference.rubberband import default_formant_shift, rubberband_shift
+from inference.signalsmith import signalsmith_shift
+
+
+DEMUCS_SR = 44100
+# The auto engine uses the model only above this many semitones. Rubber Band
+# scored better on every evaluate.py measure at 1 semitone and on the round
+# trip at 3; the model was ahead at 6.
+AUTO_MODEL_ABOVE = 3.0
+
+
+def model_formant_shift(semis: float) -> float:
+    # Formants follow a quarter of a downward shift and stay put on an upward
+    # one. In blind listening (20 Nov 2026, one listener) that won both
+    # downward excerpts at 6 semitones; plain preservation won the upward one.
+    return 0.25 * semis if semis < 0 else 0.0
+
+
+def _resolve_device(arg: str) -> torch.device:
+    if arg == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(arg)
+
+
+def _peak_normalize(audio: np.ndarray, headroom: float = 0.99) -> np.ndarray:
+    peak = float(np.max(np.abs(audio))) + 1e-9
+    if peak > headroom:
+        audio = audio * (headroom / peak)
+    return audio.astype(np.float32, copy=False)
+
+
+def _default_output(input_path: Path, semis: float) -> Path:
+    sign = "+" if semis >= 0 else "-"
+    mag = f"{abs(semis):g}"
+    return input_path.with_name(f"{input_path.stem}_shifted_{sign}{mag}st.wav")
+
+
+def _match_length(x: np.ndarray, length: int) -> np.ndarray:
+    if x.shape[-1] >= length:
+        return x[..., :length]
+    pad = [(0, 0)] * (x.ndim - 1) + [(0, length - x.shape[-1])]
+    return np.pad(x, pad)
+
+
+def _write_wav(path: Path, audio: np.ndarray, sr: int) -> None:
+    if audio.ndim == 1:
+        tensor = torch.from_numpy(audio).unsqueeze(0)
+    else:
+        tensor = torch.from_numpy(audio)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torchaudio.save(str(path), tensor, sr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        description="Pitch-shift the vocals of a song and remix it."
+    )
+    p.add_argument("input", type=Path, help="Input audio file (wav/mp3/flac/...).")
+    p.add_argument(
+        "-s",
+        "--semitones",
+        type=float,
+        required=True,
+        help="Semitone shift. Positive = up, negative = down.",
+    )
+    p.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Output wav path. Default: <input_stem>_shifted_<+N>st.wav next to input.",
+    )
+    p.add_argument(
+        "--engine",
+        default="auto",
+        choices=["auto", "rubberband", "model"],
+        help=f"auto (default): rubberband for shifts up to {AUTO_MODEL_ABOVE:g} "
+        "semitones, model above that if a checkpoint is found. rubberband: "
+        "Rubber Band with formant control (needs the `rubberband` CLI). model: "
+        "WORLD + PitchUNet + vocoder (needs a trained checkpoint).",
+    )
+    p.add_argument(
+        "--formant-shift",
+        type=float,
+        default=None,
+        help="Semitones the formants move. Default: rubberband engine, a "
+        "quarter of the shift; model engine, a quarter of a downward shift "
+        "and none for an upward one.",
+    )
+    p.add_argument(
+        "--mode",
+        default="song",
+        choices=["song", "vocals"],
+        help="song: transpose the whole song (vocals with the engine, bass and "
+        "other instruments with Signalsmith Stretch, drums untouched). "
+        "vocals: shift only the vocals against the original backing.",
+    )
+    p.add_argument(
+        "--no-separate",
+        action="store_true",
+        help="Skip Demucs and shift the input as it is. Meant for solo vocal "
+        "recordings; the model engine only handles a single voice.",
+    )
+    p.add_argument(
+        "--ckpt",
+        type=Path,
+        default=None,
+        help="PitchUNet checkpoint. Default: ./best.pt, else ./final.pt, "
+        "else latest step_*.pt under ./checkpoints/.",
+    )
+    p.add_argument(
+        "--no-ema",
+        action="store_true",
+        help="Load raw model weights instead of the EMA shadow.",
+    )
+    p.add_argument(
+        "--vocoder-repo",
+        default=TrainConfig().vocoder_repo,
+        help="HF repo id of the vocoder (HiFi-GAN or BigVGAN). Should be the "
+        "one the model was trained against.",
+    )
+    p.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Clip batch size for the UNet+vocoder loop.",
+    )
+    p.add_argument("-v", "--verbose", action="store_true")
+    args = p.parse_args(argv)
+
+    if not args.input.exists():
+        print(f"Input not found: {args.input}", file=sys.stderr)
+        return 2
+
+    device = _resolve_device(args.device)
+    engine = args.engine
+    ckpt = None
+    if engine in ("auto", "model"):
+        ckpt = args.ckpt or find_ckpt(Path("./checkpoints"))
+    if engine == "auto":
+        if abs(args.semitones) <= AUTO_MODEL_ABOVE:
+            engine = "rubberband"
+        elif ckpt is None:
+            print("No model checkpoint found; using Rubber Band.", file=sys.stderr)
+            engine = "rubberband"
+        else:
+            engine = "model"
+
+    formant = args.formant_shift
+    if formant is None:
+        if engine == "rubberband":
+            formant = default_formant_shift(args.semitones)
+        else:
+            formant = model_formant_shift(args.semitones)
+
+    if engine == "rubberband":
+        if args.verbose:
+            print(f"Engine: Rubber Band, formants {formant:+g} semitones")
+
+        def shift(audio: np.ndarray) -> np.ndarray:
+            # audio: [samples] or [2, samples] @ DEMUCS_SR
+            return rubberband_shift(audio, DEMUCS_SR, args.semitones, formant)
+
+    else:
+        max_shift = TrainConfig().perturb_st
+        if abs(args.semitones) > max_shift:
+            print(
+                f"Warning: the model was trained on shifts up to ±{max_shift} "
+                f"semitones; {args.semitones:+g} is outside that range.",
+                file=sys.stderr,
+            )
+        if ckpt is None:
+            print(
+                "No checkpoint found in ./checkpoints/ and --ckpt not given.",
+                file=sys.stderr,
+            )
+            return 2
+        if args.verbose:
+            print(f"Engine: model, formants {formant:+g} semitones")
+            print(f"Loading PitchUNet from {ckpt}")
+        unet = load_unet(ckpt, device, use_ema=not args.no_ema)
+
+        # Local imports keep cold startup snappy if -h is the only ask.
+        from inference.pipeline import shift_audio_through_model
+        from inference.vocoder import load_vocoder
+
+        if args.verbose:
+            print(f"Loading vocoder from {args.vocoder_repo}")
+        vocoder = load_vocoder(args.vocoder_repo, device)
+
+        def through_model(mono: np.ndarray) -> np.ndarray:
+            return shift_audio_through_model(
+                mono,
+                DEMUCS_SR,
+                args.semitones,
+                unet,
+                vocoder,
+                device,
+                batch_size=args.batch_size,
+                verbose=args.verbose,
+                formant_semis=formant,
+            )
+
+        def shift(audio: np.ndarray) -> np.ndarray:
+            if audio.ndim == 1:
+                return through_model(audio)
+            # Mid/side: the mid (what both channels share, i.e. the voice)
+            # goes through the model; the side (reverb, doubles) is not a
+            # single voice, so Rubber Band shifts it with the same formant
+            # setting, and the stereo image is rebuilt. A plain phase vocoder
+            # here moved the side's formants with the pitch.
+            mid = through_model(audio.mean(axis=0))
+            side = (audio[0] - audio[1]) / 2.0
+            if float(np.abs(side).max()) > 1e-6:
+                side = rubberband_shift(side, DEMUCS_SR, args.semitones, formant)
+                side = _match_length(side, mid.shape[-1])
+            return np.stack([mid + side, mid - side], axis=0)
+
+    default_name = _default_output(args.input, args.semitones).name
+    if args.output is None:
+        output = _default_output(args.input, args.semitones)
+    elif args.output.is_dir() or str(args.output).endswith("/"):
+        output = args.output / default_name
+    else:
+        output = args.output
+
+    if args.no_separate:
+        # The model shifts one voice, so it gets mono; Rubber Band keeps stereo.
+        mono = engine == "model"
+        if args.verbose:
+            print(f"Loading {args.input} @ {DEMUCS_SR} Hz")
+        audio, _ = librosa.load(args.input, sr=DEMUCS_SR, mono=mono)
+        if args.verbose:
+            print(f"Shifting by {args.semitones:+g} semitones")
+        shifted = _peak_normalize(shift(audio))
+        _write_wav(output, shifted, DEMUCS_SR)
+        if args.verbose:
+            print(f"Wrote {output} @ {DEMUCS_SR} Hz")
+        return 0
+
+    from inference.separation import separate_stems
+
+    if args.verbose:
+        print(f"Loading {args.input} (stereo @ {DEMUCS_SR} Hz)")
+    audio, _ = librosa.load(args.input, sr=DEMUCS_SR, mono=False)
+    if audio.ndim == 1:
+        audio = np.stack([audio, audio], axis=0)
+    audio_t = torch.from_numpy(audio.astype(np.float32))
+
+    if args.verbose:
+        print("Running Demucs separation")
+    stems = separate_stems(audio_t, DEMUCS_SR, device)
+
+    stems_dir = output.with_name(f"{output.stem}_stems")
+    stems_dir.mkdir(parents=True, exist_ok=True)
+    for name, tensor in stems.items():
+        _write_wav(stems_dir / f"{name}.wav", tensor.numpy(), DEMUCS_SR)
+    if args.verbose:
+        print(f"Saved stems to {stems_dir}")
+
+    if args.verbose:
+        print(f"Shifting vocals by {args.semitones:+g} semitones")
+    shifted_44k = shift(stems["vocals"].numpy())
+
+    backing = {name: stems[name].numpy() for name in ("drums", "bass", "other")}
+    if args.mode == "song":
+        # Shifting only the vocal leaves it in a different key from the band.
+        # Drums have no key, and shifting them just damages the transients.
+        if args.verbose:
+            print("Shifting bass and other instruments")
+        pitched = signalsmith_shift(
+            backing.pop("bass") + backing.pop("other"), DEMUCS_SR, args.semitones
+        )
+        backing["pitched"] = pitched
+
+    target_len = max(shifted_44k.shape[-1], int(stems["drums"].shape[-1]))
+    mix = _match_length(shifted_44k, target_len).copy()
+    for s in backing.values():
+        mix = mix + _match_length(s, target_len)
+
+    mix = _peak_normalize(mix)
+    _write_wav(output, mix, DEMUCS_SR)
+    if args.verbose:
+        print(f"Wrote {output} @ {DEMUCS_SR} Hz")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

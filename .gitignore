@@ -1,0 +1,30 @@
+# tooling
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.venv/
+__pycache__/
+*.swp
+.DS_Store
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# data, checkpoints and run outputs
+cache/
+datasets/
+checkpoints/
+runs/
+wandb/
+.smoke/
+best.pt
+final.pt
+*.safetensors
+eval_results.json
+example.wav
+*_stems/
+
+# commercial song excerpts: never commit
+listening/
