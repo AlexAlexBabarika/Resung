@@ -17,12 +17,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # CPUs this container may use. Vast.ai limits a container with a cgroup CPU
-# quota, but nproc still counts every core on the host, often 64 to 256. One
+# quota, but nproc still counts every core on the host, often 64 to 256. (And
+# nproc caps its answer at OMP_NUM_THREADS when that is set, which once gave
+# every GPU a single loader worker; hence the env -u.) One
 # data-loader worker per host core, each starting an OpenMP pool of that many
 # threads, runs out of threads ("libgomp: Thread creation failed").
 cpus_available() {
     local n quota period
-    n="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+    n="$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || sysctl -n hw.ncpu)"
     if [ -r /sys/fs/cgroup/cpu.max ]; then                 # cgroup v2
         read -r quota period < /sys/fs/cgroup/cpu.max
     elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then  # cgroup v1
@@ -83,7 +85,7 @@ free_space() {
         echo "WARNING: /dev/shm is under 4 GB; the data loader may crash (\"bus error\")." \
              "Pick an instance with a larger shm, or lower WORKERS."
     fi
-    echo "CPUs: $CPUS usable (nproc says $(nproc 2>/dev/null || sysctl -n hw.ncpu)), $GPUS GPUs, $WORKERS loader workers per GPU"
+    echo "CPUs: $CPUS usable (nproc says $(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc 2>/dev/null || sysctl -n hw.ncpu)), $GPUS GPUs, $WORKERS loader workers per GPU"
 }
 
 run_train() {
