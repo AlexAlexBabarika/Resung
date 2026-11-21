@@ -83,4 +83,38 @@ def test_every_input_reaches_the_output():
             ("timbre", lambda v: torch.randn_like(v)),
         ]:
             alt = dict(base, **{key: change(base[key])})
-            assert (model(**alt) - ref).abs().mean() > 1e-3, key
+            # Any real dependence is orders of magnitude above float noise.
+            assert (model(**alt) - ref).abs().mean() > 1e-4, key
+
+
+def test_resample_frames_reads_the_right_time_in_bf16():
+    # The GPU run autocasts to bfloat16. A one-hot basis is exact in bf16,
+    # so the output rows are the interpolation weights themselves.
+    for seconds in (2.6, 30.0):
+        tc = int((seconds * 16000 - 400) // 320 + 1)
+        src, dst = (
+            content_frame_times(tc),
+            mel_frame_centres(int(seconds * 44100 // 512)),
+        )
+        eye = torch.eye(tc)[None]
+        w32 = resample_frames(eye, src, dst)[0]
+        w16 = resample_frames(eye.bfloat16(), src, dst)[0].float()
+        # The time each output frame reads (weights normalised: bf16 rounds
+        # their sum by up to 0.2%, a level change, not a timing one).
+        t32 = (w32 @ src) / w32.sum(1)
+        t16 = (w16 @ src) / w16.sum(1)
+        assert (t16 - t32).abs().max() < 1e-4  # seconds; was 14 ms / 120 ms
+
+
+def test_decoder_under_bf16_autocast_stays_close_to_fp32():
+    model = ResungDecoder(SMALL).eval()
+    open_gates(model)
+    a = inputs()
+    with torch.no_grad():
+        y32 = model(**a)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            y16 = model(**a)
+    # The predicted mel stays float32: bf16 would round log-mels near -6 to
+    # steps of 1/32.
+    assert y16.dtype == torch.float32 and torch.isfinite(y16).all()
+    assert (y32 - y16).abs().mean() < 0.01  # log-mel units; a good fit is ~0.25

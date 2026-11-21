@@ -179,7 +179,7 @@ class ModelConfig:
     ff_mult: int = 4
     conv_kernel: int = 15
     cond_dim: int = 256
-    f0_fourier: int = 16  # sin/cos pairs of log-F0
+    f0_fourier: int = 11  # sin/cos pairs of log-F0, periods 16 octaves down to 19 cents
     dropout: float = 0.1
 
 

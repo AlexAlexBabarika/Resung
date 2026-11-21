@@ -42,12 +42,18 @@ def resample_frames(
     x: torch.Tensor, src_t: torch.Tensor, dst_t: torch.Tensor
 ) -> torch.Tensor:
     """Linear interpolation of x [B, Ts, C] from times src_t [Ts] to dst_t
-    [Td]; times outside the source hold the end frames."""
-    src_t, dst_t = src_t.to(x.device, x.dtype), dst_t.to(x.device, x.dtype)
+    [Td]; times outside the source hold the end frames.
+
+    Indices and weights are computed in float32 whatever x's dtype: in
+    bfloat16 (autocast) the time grids themselves round off, and the content
+    was read up to 14 ms off in a 2.6 s crop, 120 ms off in a 30 s window."""
+    src_t = src_t.to(x.device, torch.float32)
+    dst_t = dst_t.to(x.device, torch.float32)
     hi = torch.searchsorted(src_t, dst_t).clamp(1, len(src_t) - 1)
     lo = hi - 1
     w = ((dst_t - src_t[lo]) / (src_t[hi] - src_t[lo])).clamp(0.0, 1.0)
-    return x[:, lo] * (1 - w)[None, :, None] + x[:, hi] * w[None, :, None]
+    w = w.to(x.dtype)[None, :, None]
+    return x[:, lo] * (1 - w) + x[:, hi] * w
 
 
 class AdaNorm(nn.Module):
@@ -70,15 +76,18 @@ class AdaNorm(nn.Module):
 
 def rotary(x: torch.Tensor) -> torch.Tensor:
     """Rotary position embedding on [B, H, T, Dh]: relative positions, so
-    attention behaves the same on windows longer than the training crop."""
+    attention behaves the same on windows longer than the training crop.
+    The rotation runs in float32 and the result returns in x's dtype."""
     t, dh = x.shape[-2], x.shape[-1]
     freqs = 1.0 / (
         10000.0 ** (torch.arange(0, dh, 2, device=x.device, dtype=torch.float32) / dh)
     )
     ang = torch.arange(t, device=x.device, dtype=torch.float32)[:, None] * freqs[None]
-    cos, sin = ang.cos().to(x.dtype), ang.sin().to(x.dtype)
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+    cos, sin = ang.cos(), ang.sin()
+    xf = x.float()
+    x1, x2 = xf[..., 0::2], xf[..., 1::2]
+    out = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1).flatten(-2)
+    return out.to(x.dtype)
 
 
 class Attention(nn.Module):
@@ -170,7 +179,9 @@ class ResungDecoder(nn.Module):
             nn.Linear(cfg.content_dim, cfg.content_bottleneck),
             nn.Linear(cfg.content_bottleneck, cfg.dim),
         )
-        # log2(F0 / 440) spans about -3.9 (30 Hz) to +2.5 (2.5 kHz).
+        # log2(F0 / 440) spans about -3.9 (30 Hz) to +2.5 (2.5 kHz). Periods
+        # run from 16 octaves down to 2^-6 octave (19 cents); finer ones would
+        # only encode RMVPE's few cents of jitter.
         self.register_buffer(
             "f0_freqs",
             math.pi * 2.0 ** torch.arange(cfg.f0_fourier, dtype=torch.float32) / 8.0,
@@ -214,7 +225,11 @@ class ResungDecoder(nn.Module):
         for block in self.blocks:
             x = block(x, cond, mask)
         h, _ = self.n_out(x, cond)
-        return self.out(h).transpose(1, 2)  # [B, n_mels, T]
+        # The projection to the mel runs in float32 even under autocast:
+        # in bf16, log-mels around -6 round to steps of 1/32.
+        with torch.autocast(device_type=h.device.type, enabled=False):
+            mel = self.out(h.float())
+        return mel.transpose(1, 2)  # [B, n_mels, T]
 
 
 def count_params(m: nn.Module) -> int:

@@ -74,6 +74,15 @@ data() {
 
 free_space() {
     echo "free disk space here: $(df -h . | awk 'NR==2 {print $4}')"
+    # Loader workers hand batches over through /dev/shm: about 0.8 MB per clip,
+    # a few batches in flight per worker. Docker's 64 MB default crashes them.
+    local shm_mb
+    shm_mb="$(df -m /dev/shm 2>/dev/null | awk 'NR==2 {print $2}')"
+    echo "/dev/shm: ${shm_mb:-?} MB"
+    if [ -n "$shm_mb" ] && [ "$shm_mb" -lt 4096 ]; then
+        echo "WARNING: /dev/shm is under 4 GB; the data loader may crash (\"bus error\")." \
+             "Pick an instance with a larger shm, or lower WORKERS."
+    fi
     echo "CPUs: $CPUS usable (nproc says $(nproc 2>/dev/null || sysctl -n hw.ncpu)), $GPUS GPUs, $WORKERS loader workers per GPU"
 }
 

@@ -73,14 +73,14 @@ class WaveLoss(nn.Module):
         mask [B, T]. Returns (stft, mel) losses, or None if no clip in the
         batch is long enough for a crop."""
         ctx, hop, frames = self.CONTEXT, self.hop, self.frames
-        valid = mask.sum(-1).long()
-        rows = torch.nonzero(valid >= frames + 2 * ctx).flatten()[: self.batch]
-        if len(rows) == 0:
+        valid = mask.sum(-1).long().tolist()  # one device-to-host copy
+        rows = [r for r, v in enumerate(valid) if v >= frames + 2 * ctx][: self.batch]
+        if not rows:
             return None
         span = frames + 2 * ctx
         mels, f0s, tgts = [], [], []
-        for r in rows.tolist():
-            hi = int(valid[r]) - frames - ctx
+        for r in rows:
+            hi = valid[r] - frames - ctx
             a = ctx + int(torch.randint(0, hi - ctx + 1, (1,), generator=rng))
             mels.append(pred_mel[r, :, a - ctx : a - ctx + span])
             f0s.append(f0[r, a - ctx : a - ctx + span])

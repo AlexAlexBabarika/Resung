@@ -26,6 +26,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from dotenv import load_dotenv
+from huggingface_hub import snapshot_download
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -78,9 +79,13 @@ class Stage1(nn.Module):
         cfg: TrainConfig,
         device: torch.device,
         model_cfg: ModelConfig = ModelConfig(),
+        bf16: bool | None = None,
     ):
+        """bf16: autocast the decoder and ContentVec to bfloat16 (default: on
+        CUDA only; the vocoder losses always run in float32)."""
         super().__init__()
         self.cfg = cfg
+        self.bf16 = device.type == "cuda" if bf16 is None else bf16
         self.decoder = ResungDecoder(model_cfg)
         self.content = ContentVec()
         self.logmel = LogMel()
@@ -93,11 +98,14 @@ class Stage1(nn.Module):
         decoder: nn.Module | None = None,
         clean_content: bool | None = None,
         rng: torch.Generator | None = None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """decoder: the module to run (the DDP wrapper in training, the EMA
         copy in validation). clean_content: force clean (True) or perturbed
-        (False) content for every clip; None mixes by p_clean_content."""
-        decoder = decoder or self.decoder
+        (False) content for every clip; None mixes by p_clean_content.
+        The parts come back as detached tensors: converting them to floats
+        every step would stall the GPU."""
+        if decoder is None:
+            decoder = self.decoder
         dev = next(self.decoder.parameters()).device
         b = {k: v.to(dev, non_blocking=True) for k, v in batch.items()}
         mask = b["mask"]
@@ -109,24 +117,24 @@ class Stage1(nn.Module):
                 pick = torch.full((mask.shape[0],), clean_content, device=dev)
             content_audio = torch.where(pick[:, None], b["audio16"], b["audio16_pert"])
             with torch.autocast(
-                device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"
+                device_type=dev.type, dtype=torch.bfloat16, enabled=self.bf16
             ):
                 content = self.content(content_audio).float()
         with torch.autocast(
-            device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"
+            device_type=dev.type, dtype=torch.bfloat16, enabled=self.bf16
         ):
             pred = decoder(content, b["f0"], b["uv"], b["loudness"], b["timbre"], mask)
         pred = pred.float()
         mel = masked_l1(pred, mel_tgt, mask)
         loss = self.cfg.w_mel * mel
-        parts = {"mel": mel.item()}
+        parts = {"mel": mel.detach()}
         if self.cfg.w_stft > 0 or self.cfg.w_wave_mel > 0:
             wave = self.wave(pred, b["f0"], b["audio"], mask, rng)
             if wave is not None:
                 stft, wave_mel = wave
                 loss = loss + self.cfg.w_stft * stft + self.cfg.w_wave_mel * wave_mel
-                parts |= {"stft": stft.item(), "wave_mel": wave_mel.item()}
-        parts["loss"] = loss.item()
+                parts |= {"stft": stft.detach(), "wave_mel": wave_mel.detach()}
+        parts["loss"] = loss.detach()
         return loss, parts
 
 
@@ -145,9 +153,10 @@ def setup_distributed(requested: str) -> tuple[int, int, torch.device]:
     if world > 1:
         local = int(os.environ["LOCAL_RANK"])
         if torch.cuda.is_available() and requested in ("auto", "cuda"):
-            torch.cuda.set_device(local)
-            dist.init_process_group("nccl")
-            return dist.get_rank(), world, torch.device("cuda", local)
+            device = torch.device("cuda", local)
+            torch.cuda.set_device(device)
+            dist.init_process_group("nccl", device_id=device)
+            return dist.get_rank(), world, device
         dist.init_process_group("gloo")
         return dist.get_rank(), world, torch.device("cpu")
     if requested != "auto":
@@ -211,7 +220,7 @@ def validate(
         for name, clean in (("clean", True), ("pert", False)):
             _, parts = stage.losses(batch, eval_decoder, clean_content=clean, rng=rng)
             for k, v in parts.items():
-                sums[f"{k}_{name}"] = sums.get(f"{k}_{name}", 0.0) + v
+                sums[f"{k}_{name}"] = sums.get(f"{k}_{name}", 0.0) + v.item()
         n += 1
     if n == 0:
         return math.inf
@@ -281,6 +290,11 @@ def main(argv=None):
     rank, world, device = setup_distributed(args.device)
     main_proc = rank == 0
     torch.manual_seed(args.seed + rank)
+    if device.type == "cuda":
+        # Fixed shapes every step: let cuDNN pick its fastest kernels, and
+        # let the float32 vocoder pass use TF32 matmuls.
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     out_dir = args.out_dir
     ckpt_dir = out_dir / cfg.ckpt_dir
@@ -290,9 +304,11 @@ def main(argv=None):
                 f"{out_dir / 'final.pt'} exists: training is complete. Delete it to start a new run."
             )
         sys.exit(0)
-    # One rank downloads the vocoder; the others wait for it.
+    # One rank downloads the pretrained models; the others wait for it.
     if main_proc:
         checkpoint_path()
+        fe = FrontendConfig()
+        snapshot_download(fe.content_repo, revision=fe.content_revision)
     if world > 1:
         dist.barrier()
 
@@ -304,8 +320,12 @@ def main(argv=None):
         )
     decoder: nn.Module = stage.decoder
     if world > 1:
+        # The decoder's only buffer is a constant, so there is nothing to
+        # broadcast before every forward.
         decoder = DDP(
-            stage.decoder, device_ids=[device.index] if device.type == "cuda" else None
+            stage.decoder,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            broadcast_buffers=False,
         )
 
     opt = torch.optim.AdamW(
@@ -400,11 +420,12 @@ def main(argv=None):
             if main_proc and step % cfg.log_every == 0:
                 assert writer is not None
                 lr = sched.get_last_lr()[0]
-                for k, v in parts.items():
+                parts_f = {k: v.item() for k, v in parts.items()}
+                for k, v in parts_f.items():
                     writer.add_scalar(f"train/{k}", v, step)
                 writer.add_scalar("train/lr", lr, step)
                 writer.add_scalar("train/grad_norm", float(grad_norm), step)
-                msg = " ".join(f"{k} {v:.4f}" for k, v in parts.items())
+                msg = " ".join(f"{k} {v:.4f}" for k, v in parts_f.items())
                 print(f"step {step} {msg} lr {lr:.2e}", flush=True)
 
             if step % cfg.val_every == 0 or step == cfg.max_steps:
