@@ -13,9 +13,10 @@ with an NSF-HiFiGAN vocoder generates the voice at the new pitch. It is trained
 self-supervised, with an adversarial loss. Instruments stay on Signalsmith Stretch
 and drums stay untouched.
 
-Built so far: the 44.1 kHz front end and the training cache (`frontend/`,
-`data.py`, `Process_HF_Datasets.py`). The decoder, the vocoder fine-tuning and the
-new inference path come next. Until Resung beats its predecessor in `evaluate.py`
+Built so far: the 44.1 kHz front end and training cache (`frontend/`, `data.py`,
+`Process_HF_Datasets.py`), the decoder (`model.py`) and stage-1 training against
+the frozen vocoder (`train.py`). The adversarial stage, which also fine-tunes the
+vocoder, and the new inference path come next. Until Resung beats its predecessor in `evaluate.py`
 and a blind listening test, inference runs on the inherited pipeline described
 below, which serves as the baseline.
 
@@ -31,6 +32,25 @@ training on a copy of the clip that WORLD has shifted by a random amount of up t
 purpose, and the decoder has to
 take its pitch from the F0 track. The mel settings match the PC-NSF-HiFiGAN
 vocoder (44.1 kHz, 128 bands, hop 512, 40 Hz–16 kHz).
+
+## Decoder and stage 1
+
+The decoder (`model.py`, 32 M parameters) turns those inputs into the vocoder's
+mel: the content passes through a 256-wide bottleneck and is interpolated onto
+the mel frames, joined by Fourier features of log-F0 and the loudness, and run
+through ten conv + self-attention blocks (rotary positions); the timbre
+embedding enters every block through adaptive layer norms whose residual gates
+start at zero. [PC-NSF-HiFiGAN](https://github.com/openvpi/SingingVocoders)
+(OpenVPI, weights CC BY-NC-SA 4.0, downloaded from the official release and
+checksum-verified; generator code vendored in `vocoder/`, MIT) renders the mel
+at the F0 it is given.
+
+Stage 1 trains the decoder against the frozen vocoder: mel L1, plus a
+multi-resolution STFT loss and the vocoder-mel L1 on a crop rendered through the
+vocoder. A fifth of the clips use clean content, as inference does.
+`scripts/vocoder_check.py` checks the vocoder on cached clips (alignment, copy
+synthesis, its own pitch shift); `scripts/listen_stage1.py` renders a trained
+checkpoint's reconstructions and shifts next to the vocoder's own shift.
 
 ## Current pipeline (inherited)
 
@@ -75,7 +95,7 @@ song.wav
                        └─ drums/bass/other ─────────┴──► remix ──► shifted.wav
 ```
 
-The core model, **`PitchUNet`** (`model.py`), is a 2-D U-Net over log-mel
+The core model, **`PitchUNet`** (`pitch_unet.py`), is a 2-D U-Net over log-mel
 spectrograms. It is conditioned on:
 
 - **Shift amount** (semitones), embedded and injected through FiLM layers in every
@@ -92,9 +112,9 @@ A self-attention block sits in the bottleneck. The network predicts a residual o
 its input mel and the output head is zero-initialized, so training starts from the
 identity (i.e. from the quality of the WORLD shift).
 
-Training (`train.py`) uses an L1 + multi-resolution + difference loss on the mel and
+Its training (in the predecessor's repository) used an L1 + multi-resolution + difference loss on the mel and
 a multi-resolution STFT loss on audio rendered through the frozen vocoder
-(`losses.py`; set `w_wave = 0` to turn the latter off), AdamW
+(set `w_wave = 0` to turn the latter off), AdamW
 with cosine decay and warmup, EMA weights, gradient clipping, and bf16 autocast on
 CUDA. The input mel comes from a WORLD round trip (shift by `+s`, then back by
 `-s`) of the original clip, so the network learns to remove the artifacts of a
@@ -121,9 +141,13 @@ the U-Net sees it, so the formants follow a little, as a real voice's do.
 | `scripts/check_cache.py` | Sanity checks on the cache before renting a GPU |
 | `tests/` | `uv run pytest` (`-m 'not models'` skips the pretrained-model tests) |
 | `audio_preprocessing.py` | Baseline only: CREPE F0, WORLD shift, 22.05 kHz mels |
-| `model.py` | `PitchUNet` and conditioning modules |
-| `losses.py` | Mel losses and the waveform loss through the frozen vocoder |
-| `train.py` | Training loop, EMA, checkpointing, TensorBoard / W&B logging |
+| `model.py` | `ResungDecoder`: content, F0, loudness and timbre → the vocoder's mel |
+| `vocoder/` | PC-NSF-HiFiGAN generator (vendored, MIT) and the checksum-verified weight download |
+| `losses.py` | Mel L1, and the STFT and vocoder-mel losses through the frozen vocoder |
+| `train.py` | Stage 1: one device or `torchrun` across GPUs, EMA, checkpoints, TensorBoard, speed and cost projection |
+| `scripts/vocoder_check.py`, `scripts/listen_stage1.py` | Vocoder check; listening and pitch check of a trained checkpoint |
+| `scripts/vast.sh` | Rented-GPU workflow: setup, data, smoke, train, listen |
+| `pitch_unet.py` | Baseline only: the predecessor's `PitchUNet` |
 | `inference.py` | CLI entrypoint: separate → shift → remix |
 | `inference/` | Demucs separation, vocoders (BigVGAN, HiFi-GAN), stitching, pipeline |
 
@@ -176,7 +200,7 @@ Flags for the `model` engine:
   `./checkpoints/step_*.pt`)
 - `--no-ema` — use raw weights instead of the EMA shadow
 - `--vocoder-repo` — HF repo of the vocoder; BigVGAN and HiFi-GAN repos both work
-  (default: `TrainConfig.vocoder_repo`, the one the model was trained against)
+  (default: `BaselineConfig.vocoder_repo`, the one the model was trained against)
 - `--device` — `auto` | `cuda` | `mps` | `cpu`
 - `-v, --verbose` — progress output
 
@@ -193,32 +217,33 @@ uv run Download_HF_Datasets.py
 uv run Process_HF_Datasets.py
 uv run scripts/check_cache.py
 
-# 3. train
+# 3. stage 1, on one device or one process per GPU
 uv run train.py
+uv run torchrun --standalone --nproc_per_node=4 train.py
 ```
 
-`train.py` is still the predecessor's trainer and doesn't read the new cache; it
-is being replaced.
-
-`train.py` takes `--max-steps`, `--val-every`, `--save-every`, `--batch-size`,
-`--num-workers` and `--out-dir` to override `TrainConfig` for a run. It resumes
-from the latest checkpoint in `<out-dir>/checkpoints/`.
+`train.py` takes `--max-steps`, `--val-every`, `--save-every`, `--batch-size` (per
+GPU), `--num-workers` (per GPU), `--log-every`, `--out-dir`, `--cache-dir` and
+`--datasets` to override `TrainConfig` for a run, and `--price-per-hour` to turn
+its speed report into a cost. It writes to `stage1/` by default and resumes from
+the latest checkpoint in `<out-dir>/checkpoints/`.
 
 ### On a rented GPU (Vast.ai)
 
-Pick an Ubuntu image with an NVIDIA driver, a 24 GB card, 8 or more CPU cores (the
-loader runs WORLD on the CPU for every clip) and about 40 GB of disk. Clone the
-repository, then:
+Pick an Ubuntu image with an NVIDIA driver, one or more 24 GB+ cards, about 16
+CPU cores per GPU (the loader runs WORLD on the CPU for every clip), 128 GB of RAM
+for a multi-GPU box, and about 150 GB of disk. Clone the repository, then:
 
 ```bash
 HF_TOKEN=hf_... bash scripts/vast.sh setup   # system packages, uv, Python deps
 bash scripts/vast.sh data                    # download, preprocess, sanity-check the cache
-bash scripts/vast.sh smoke                   # 60 steps end to end before paying for hours
-tmux new -s train 'bash scripts/vast.sh train'
-bash scripts/vast.sh eval
+PRICE=2.6 bash scripts/vast.sh smoke         # vocoder check + 60 steps; projects hours and $
+tmux new -s train 'PRICE=2.6 bash scripts/vast.sh train'
+bash scripts/vast.sh listen                  # reconstructions and shifts from stage1/best.pt
 ```
 
-Copy `best.pt` off the machine before destroying the instance.
+Stage 1 writes into `stage1/` (the repository root keeps the baseline's
+`best.pt`). Copy `stage1/best.pt` off the machine before destroying the instance.
 
 Datasets, the per-dataset hour budget, and the train/val split are configured in
 `DataConfig`. Validation holds out whole speakers, singers and instruments, so
@@ -229,15 +254,18 @@ non-commercial use only), drawn by the `share` in each `DatasetSpec`: a quarter
 speech, three quarters singing. OpenSinger (male/female) is processed for
 validation only: the Hugging Face copy is 16 kHz, which is fine as input to the
 16 kHz analysis models but has nothing above 8 kHz to serve as a 44.1 kHz target.
-NSynth is still defined but no longer loaded. Checkpoints land in `./checkpoints/`
+NSynth is still defined but no longer loaded. Checkpoints land in `stage1/checkpoints/`
 (pruned to the last few), with `best.pt` written whenever validation improves and
-`final.pt` at the end of training; logs go
-to `./runs/` (TensorBoard) and optionally Weights & Biases.
+`final.pt` at the end of training; logs go to `stage1/runs/` (TensorBoard).
 
 ## Evaluation
 
+`evaluate.py` still reads the predecessor's 22.05 kHz cache and is being ported
+to the new one, with Resung, the vocoder's own shift and speaker similarity added as
+systems. As it stands:
+
 ```bash
-uv run evaluate.py            # uses ./best.pt and the held-out validation clips
+uv run evaluate.py            # uses ./best.pt (the baseline) and the held-out validation clips
 ```
 
 Scores the full system against `librosa`, Rubber Band (if the `rubberband` CLI is

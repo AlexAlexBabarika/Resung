@@ -18,7 +18,7 @@ from audio_preprocessing import (
     extract_f0,
     world_pitch_shift,
 )
-from config import AudioConfig, TrainConfig
+from config import AudioConfig, BaselineConfig
 from data import PitchDataset
 from inference.checkpoint import find_ckpt, load_unet
 from inference.pipeline import shift_clip_batch
@@ -174,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--shifts", default="-6,-3,-1,1,3,6")
     p.add_argument("--n-clips", type=int, default=200)
     p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--vocoder-repo", default=TrainConfig().vocoder_repo)
+    p.add_argument("--vocoder-repo", default=BaselineConfig().vocoder_repo)
     p.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     p.add_argument("--out", type=Path, default=Path("eval_results.json"))
     args = p.parse_args(argv)

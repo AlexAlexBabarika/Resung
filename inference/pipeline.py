@@ -16,7 +16,7 @@ from audio_preprocessing import (
 from config import AudioConfig
 from inference.stitch import overlap_add
 from inference.vocoder import Vocoder
-from model import PitchUNet
+from pitch_unet import PitchUNet
 
 
 def shift_clip_batch(

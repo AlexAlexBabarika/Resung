@@ -19,10 +19,14 @@ checkpoints/
 runs/
 wandb/
 .smoke/
+stage1/
 best.pt
 final.pt
 *.safetensors
 eval_results.json
+vocoder_check/
+listen_stage1/
+listen_stage1.log
 example.wav
 *_stems/
 

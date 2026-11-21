@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torchaudio
 
-from config import TrainConfig
+from config import BaselineConfig
 from inference.checkpoint import find_ckpt, load_unet
 from inference.rubberband import default_formant_shift, rubberband_shift
 from inference.signalsmith import signalsmith_shift
@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--vocoder-repo",
-        default=TrainConfig().vocoder_repo,
+        default=BaselineConfig().vocoder_repo,
         help="HF repo id of the vocoder (HiFi-GAN or BigVGAN). Should be the "
         "one the model was trained against.",
     )
@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
             return rubberband_shift(audio, DEMUCS_SR, args.semitones, formant)
 
     else:
-        max_shift = TrainConfig().perturb_st
+        max_shift = BaselineConfig().perturb_st
         if abs(args.semitones) > max_shift:
             print(
                 f"Warning: the model was trained on shifts up to ±{max_shift} "

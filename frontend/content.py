@@ -12,6 +12,7 @@ final_proj layer that the checkpoint carries for backward compatibility.
 import torch
 import torch.nn as nn
 from transformers import HubertModel
+from transformers.utils import logging as hf_logging
 
 from config import FrontendConfig
 
@@ -37,9 +38,16 @@ class ContentVec(nn.Module):
 
     def __init__(self):
         super().__init__()
-        model, info = HubertModel.from_pretrained(
-            cfg.content_repo, revision=cfg.content_revision, output_loading_info=True
-        )
+        # transformers would print a load report listing the expected
+        # final_proj.* leftovers; the check below inspects the same report.
+        verbosity = hf_logging.get_verbosity()
+        hf_logging.set_verbosity_error()
+        try:
+            model, info = HubertModel.from_pretrained(
+                cfg.content_repo, revision=cfg.content_revision, output_loading_info=True
+            )
+        finally:
+            hf_logging.set_verbosity(verbosity)
         missing = info["missing_keys"]
         unexpected = [
             k for k in info["unexpected_keys"] if not k.startswith("final_proj.")

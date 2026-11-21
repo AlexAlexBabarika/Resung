@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from model import PitchUNet
+from pitch_unet import PitchUNet
 
 _STEP_RE = re.compile(r"^step_(\d+)\.pt$")
 

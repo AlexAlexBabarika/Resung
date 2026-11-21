@@ -177,7 +177,18 @@ class ResungDataset(Dataset):
         }
 
     @staticmethod
-    def make_loader(split="train", batch_size=None, num_workers=None, **kwargs):
+    def make_loader(
+        split="train",
+        batch_size=None,
+        num_workers=None,
+        rank: int = 0,
+        world_size: int = 1,
+        seed: int = 0,
+        **kwargs,
+    ):
+        """Under torchrun each rank draws its own stream of training clips:
+        weighted sampling with replacement, seeded per rank, so the ranks
+        are independent draws from the same mixture."""
         ds = ResungDataset(split, **kwargs)
         is_train = split == "train"
         if num_workers is None:
@@ -185,7 +196,12 @@ class ResungDataset(Dataset):
         nw = num_workers if is_train else min(4, num_workers)
         sampler = None
         if is_train:
-            sampler = WeightedRandomSampler(ds.weights, len(ds), replacement=True)
+            sampler = WeightedRandomSampler(
+                ds.weights,
+                max(1, len(ds) // world_size),
+                replacement=True,
+                generator=torch.Generator().manual_seed(seed + 1000 * rank),
+            )
         return DataLoader(
             ds,
             batch_size=batch_size or train_cfg.batch_size,

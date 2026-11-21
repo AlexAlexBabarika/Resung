@@ -1,99 +1,97 @@
+"""Stage-1 losses: the decoder's mel, and what the frozen vocoder makes of it."""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-class MultiResMelLoss(nn.Module):
-    def __init__(self, scales=(1, 2, 4)):
-        super().__init__()
-        self.scales = scales
-
-    def forward(self, diff: torch.Tensor) -> torch.Tensor:
-        loss = 0.0
-        for s in self.scales:
-            d = diff if s == 1 else F.avg_pool2d(diff, kernel_size=s)
-            loss = loss + d.abs().mean()
-        # pyrefly: ignore [bad-return]
-        return loss / len(self.scales)
+from frontend.mel import LogMel
 
 
-class DeltaLoss(nn.Module):
-    def forward(self, diff: torch.Tensor) -> torch.Tensor:
-        # L1 on the frequency and time differences: penalises blurred
-        # harmonics and onsets that plain L1 lets through.
-        d_freq = diff[..., 1:, :] - diff[..., :-1, :]
-        d_time = diff[..., :, 1:] - diff[..., :, :-1]
-        return 0.5 * (d_freq.abs().mean() + d_time.abs().mean())
-
-
-class TotalLoss(nn.Module):
-    def __init__(self, w_l1: float = 1.0, w_mr: float = 0.5, w_delta: float = 0.5):
-        super().__init__()
-        self.mr = MultiResMelLoss()
-        self.delta = DeltaLoss()
-        self.w_l1 = w_l1
-        self.w_mr = w_mr
-        self.w_delta = w_delta
-
-    def forward(self, pred, tgt, mask):
-        # mask: [B, 1, 1, T], 1 on real frames. Every term is linear in the
-        # masked difference, so dividing by the kept fraction averages over
-        # real frames only.
-        diff = (pred - tgt) * mask
-        kept = mask.mean().clamp(min=1e-8)
-        l1 = diff.abs().mean() / kept
-        mr = self.mr(diff) / kept
-        delta = self.delta(diff) / kept
-        total = self.w_l1 * l1 + self.w_mr * mr + self.w_delta * delta
-        return total, {"l1": l1.item(), "mr": mr.item(), "delta": delta.item()}
+def masked_l1(
+    pred: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor
+) -> torch.Tensor:
+    """pred, tgt: [B, C, T]; mask: [B, T], 1 on real frames."""
+    m = mask[:, None, :].to(pred.dtype)
+    return ((pred - tgt).abs() * m).sum() / (m.sum() * pred.shape[1]).clamp(min=1.0)
 
 
 class MultiResSTFTLoss(nn.Module):
+    """Spectral convergence + log-magnitude L1, averaged over resolutions.
+    Magnitudes only: the vocoder chooses its own phases."""
+
     def __init__(self, resolutions=((512, 128), (1024, 256), (2048, 512))):
         super().__init__()
         self.resolutions = resolutions
         for n_fft, _ in resolutions:
-            self.register_buffer(f"win_{n_fft}", torch.hann_window(n_fft), False)
+            self.register_buffer(
+                f"win_{n_fft}", torch.hann_window(n_fft), persistent=False
+            )
 
     def forward(self, pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        # pred, tgt: [B, samples]. Spectral convergence + log-magnitude L1,
-        # averaged over resolutions. Magnitudes only, so phase is free.
-        loss = 0.0
+        loss = pred.new_zeros(())
         for n_fft, hop in self.resolutions:
             win = getattr(self, f"win_{n_fft}")
-            p = torch.stft(pred, n_fft, hop, window=win, return_complex=True).abs()
-            t = torch.stft(tgt, n_fft, hop, window=win, return_complex=True).abs()
-            p, t = p.clamp(min=1e-5), t.clamp(min=1e-5)
-            sc = torch.linalg.norm(t - p) / torch.linalg.norm(t)
+            p = (
+                torch.stft(pred, n_fft, hop, window=win, return_complex=True)
+                .abs()
+                .clamp(min=1e-5)
+            )
+            t = (
+                torch.stft(tgt, n_fft, hop, window=win, return_complex=True)
+                .abs()
+                .clamp(min=1e-5)
+            )
+            sc = torch.linalg.norm(t - p) / torch.linalg.norm(t).clamp(min=1e-5)
             loss = loss + sc + F.l1_loss(p.log(), t.log())
-        # pyrefly: ignore [bad-return]
         return loss / len(self.resolutions)
 
 
-class WaveformLoss(nn.Module):
-    # Renders a crop of the predicted mel with the frozen vocoder and compares
-    # it with the clean audio, so the UNet is trained on what will be heard.
-    CONTEXT = 8  # extra mel frames each side; their audio is discarded
+class WaveLoss(nn.Module):
+    """Renders a crop of the predicted mel through the frozen vocoder and
+    compares it with the audio: multi-resolution STFT, and the vocoder-mel
+    L1 of the output (the term HiFi-GAN training uses). Mel frame j renders
+    samples [j * hop, (j + 1) * hop), checked by scripts/vocoder_check.py."""
 
-    def __init__(self, generator: nn.Module, hop: int, frames: int, batch: int):
+    CONTEXT = 8  # extra frames each side; their audio is discarded
+
+    def __init__(self, generator: nn.Module, frames: int, batch: int, hop: int = 512):
         super().__init__()
-        self.generator = generator.requires_grad_(False)
+        self.generator = generator
+        self.frames, self.batch, self.hop = frames, batch, hop
         self.stft = MultiResSTFTLoss()
-        self.hop = hop
-        self.frames = frames
-        self.batch = batch
+        self.logmel = LogMel()
 
-    def forward(self, pred_mel: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
-        # pred_mel: [B, 1, n_mels, T], audio: [B, samples] aligned to the mel.
-        ctx, hop = self.CONTEXT, self.hop
-        T = pred_mel.shape[-1]
-        frames = min(self.frames, T - 2 * ctx)
-        a = int(torch.randint(ctx, T - frames - ctx + 1, (1,)))
-        mel = pred_mel[: self.batch, 0, :, a - ctx : a + frames + ctx].float()
+    def forward(
+        self,
+        pred_mel: torch.Tensor,
+        f0: torch.Tensor,
+        audio: torch.Tensor,
+        mask: torch.Tensor,
+        rng: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """pred_mel [B, n_mels, T], f0 [B, T] Hz, audio [B, T * hop],
+        mask [B, T]. Returns (stft, mel) losses, or None if no clip in the
+        batch is long enough for a crop."""
+        ctx, hop, frames = self.CONTEXT, self.hop, self.frames
+        valid = mask.sum(-1).long()
+        rows = torch.nonzero(valid >= frames + 2 * ctx).flatten()[: self.batch]
+        if len(rows) == 0:
+            return None
+        span = frames + 2 * ctx
+        mels, f0s, tgts = [], [], []
+        for r in rows.tolist():
+            hi = int(valid[r]) - frames - ctx
+            a = ctx + int(torch.randint(0, hi - ctx + 1, (1,), generator=rng))
+            mels.append(pred_mel[r, :, a - ctx : a - ctx + span])
+            f0s.append(f0[r, a - ctx : a - ctx + span])
+            tgts.append(audio[r, a * hop : (a + frames) * hop])
+        mel, f0c, tgt = (
+            torch.stack(mels).float(),
+            torch.stack(f0s).float(),
+            torch.stack(tgts).float(),
+        )
         with torch.autocast(device_type=mel.device.type, enabled=False):
-            out = self.generator(mel)[:, 0, ctx * hop : (ctx + frames) * hop]
-            # The mels are centred on i * hop while the vocoder expects frames
-            # that start there, so its output lags the audio by half a hop.
-            start = a * hop - hop // 2
-            tgt = audio[: self.batch, start : start + frames * hop].float()
-            return self.stft(out, tgt)
+            out = self.generator(mel, f0c)[:, 0, ctx * hop : (ctx + frames) * hop]
+            stft = self.stft(out, tgt)
+            wave_mel = F.l1_loss(self.logmel(out), self.logmel(tgt))
+        return stft, wave_mel

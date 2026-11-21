@@ -1,38 +1,51 @@
+"""Stage 1: train the decoder against the frozen PC-NSF-HiFiGAN.
+
+    uv run train.py [--max-steps N] [--batch-size B] ...                # one device
+    uv run torchrun --nproc_per_node=4 train.py ...                     # one per GPU
+
+Per step: ContentVec reads the WORLD-shifted 16 kHz clip (or, for a share of
+clips, the clean one), the decoder predicts the mel from that content plus the
+clean clip's F0, loudness and timbre, and the loss compares it with the clean
+clip's mel, directly and after the frozen vocoder.
+
+The run reports its measured speed and what the full run would take
+(--price-per-hour turns that into dollars).
+"""
+
 import argparse
 import math
 import os
 import re
 import sys
+import time
+import warnings
 from dataclasses import asdict
-import torch
-import wandb
-from dotenv import load_dotenv
 from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from dotenv import load_dotenv
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard.writer import SummaryWriter
-from tqdm import tqdm
-from config import AudioConfig, DataConfig, ModelConfig, TrainConfig
-from model import PitchUNet, count_params
-from inference.vocoder import load_vocoder
-from losses import TotalLoss, WaveformLoss
-from data import PitchDataset
 
-# HF_TOKEN from .env, so the vocoder and kernel downloads are authenticated.
-load_dotenv()
+from config import DataConfig, FrontendConfig, ModelConfig, TrainConfig
+from data import ResungDataset
+from frontend.content import ContentVec
+from frontend.mel import LogMel
+from losses import WaveLoss, masked_l1
+from model import ResungDecoder, count_params
+from vocoder import checkpoint_path, load_generator
 
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
+load_dotenv()  # HF_TOKEN, for authenticated model downloads
+# PyTorch's own MPS stft emits a resize deprecation warning on every call.
+warnings.filterwarnings(
+    "ignore", message="An output with one or more elements was resized"
 )
-train_config = TrainConfig()
-# Where checkpoints/, runs/, best.pt and final.pt go; set by --out-dir.
-out_dir = Path(".")
 
 
 class EMA:
-    def __init__(self, model, decay=0.999):
+    def __init__(self, model: nn.Module, decay: float):
         self.decay = decay
         self.step = 0
         self.shadow = {
@@ -42,8 +55,8 @@ class EMA:
         }
 
     @torch.no_grad()
-    def update(self, model):
-        # Ramp decay so early EMA isn't dominated by the random init.
+    def update(self, model: nn.Module):
+        # Ramped so early averages aren't dominated by the random init.
         self.step += 1
         d = min(self.decay, (1 + self.step) / (10 + self.step))
         for n, p in model.named_parameters():
@@ -51,297 +64,379 @@ class EMA:
                 self.shadow[n].mul_(d).add_(p.detach(), alpha=1 - d)
 
     @torch.no_grad()
-    def copy_to(self, model):
+    def copy_to(self, model: nn.Module):
         for n, p in model.named_parameters():
             if n in self.shadow:
                 p.copy_(self.shadow[n])
 
 
-def lr_lambda(step):
-    if step < train_config.warmup_steps:
-        return step / max(1, train_config.warmup_steps)
-    # cosine to 10% of base
-    progress = (step - train_config.warmup_steps) / max(
-        1, train_config.max_steps - train_config.warmup_steps
-    )
-    return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+class Stage1(nn.Module):
+    """Everything a training step needs; only the decoder is trainable."""
 
+    def __init__(
+        self,
+        cfg: TrainConfig,
+        device: torch.device,
+        model_cfg: ModelConfig = ModelConfig(),
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.decoder = ResungDecoder(model_cfg)
+        self.content = ContentVec()
+        self.logmel = LogMel()
+        self.wave = WaveLoss(load_generator("cpu"), cfg.wave_frames, cfg.wave_batch)
+        self.to(device)
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="Train PitchUNet.")
-    p.add_argument("--max-steps", type=int, default=None)
-    p.add_argument("--val-every", type=int, default=None)
-    p.add_argument("--save-every", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--num-workers", type=int, default=None)
-    p.add_argument(
-        "--out-dir",
-        type=Path,
-        default=Path("."),
-        help="Directory for checkpoints/, runs/, best.pt and final.pt.",
-    )
-    return p.parse_args(argv)
-
-
-def main(argv=None):
-    global out_dir
-    args = parse_args(argv)
-    for name in ("max_steps", "val_every", "save_every", "batch_size", "num_workers"):
-        if getattr(args, name) is not None:
-            setattr(train_config, name, getattr(args, name))
-    out_dir = args.out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    train_config.ckpt_dir = str(out_dir / train_config.ckpt_dir)
-    train_config.tb_dir = str(out_dir / train_config.tb_dir)
-
-    model = PitchUNet().to(device)
-    eval_model = PitchUNet().to(device)
-    print(f"Model: {count_params(model) / 1e6:.2f} M params")
-
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=train_config.lr,
-        weight_decay=train_config.weight_decay,
-        betas=train_config.betas,
-    )
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
-    loss_fn = TotalLoss().to(device)
-    wave_loss_fn = None
-    if train_config.w_wave > 0:
-        vocoder = load_vocoder(train_config.vocoder_repo, torch.device(device))
-        wave_loss_fn = WaveformLoss(
-            vocoder.generator,
-            vocoder.hop,
-            train_config.wave_frames,
-            train_config.wave_batch,
-        ).to(device)
-    ema = EMA(model, decay=train_config.ema_decay)
-
-    loader_args = (train_config.batch_size, train_config.num_workers)
-    train_loader = PitchDataset.make_loader("train", *loader_args)
-    val_loader = PitchDataset.make_loader("val", *loader_args)
-    print(
-        f"{len(train_loader.dataset)} train / {len(val_loader.dataset)} val segments, "
-        f"{len(train_loader)} steps per epoch, {train_config.max_steps} steps"
-    )
-
-    writer = SummaryWriter(log_dir=train_config.tb_dir)
-
-    step = 0
-    best_val = math.inf
-    ckpt = load_latest(Path(train_config.ckpt_dir))
-    if ckpt is not None:
-        model.load_state_dict(ckpt["model"], strict=False)
-        opt.load_state_dict(ckpt["opt"])
-        sched.load_state_dict(ckpt["sched"])
-        ema.shadow = ckpt["ema"]["shadow"]
-        ema.step = ckpt["ema"]["step"]
-        step = ckpt["step"]
-        best_val = ckpt.get("best_val", math.inf)
-        print(f"resumed from step {step}")
-
-    if train_config.use_wandb:
-        wandb.init(
-            project=train_config.wandb_project,
-            name=train_config.wandb_run_name,
-            id=train_config.wandb_run_id,
-            resume="allow",
-            config={
-                "train": asdict(train_config),
-                "audio": asdict(AudioConfig()),
-                "data": asdict(DataConfig()),
-                "model": asdict(ModelConfig()),
-            },
-        )
-        wandb.watch(model, log="gradients", log_freq=train_config.log_every)
-
-    model.train()
-    pbar = tqdm(total=train_config.max_steps, initial=step)
-    while step < train_config.max_steps:
-        for batch in train_loader:
-            mel_in = batch["mel_in"].to(device, non_blocking=True)
-            mel_tgt = batch["mel_tgt"].to(device, non_blocking=True)
-            f0 = batch["f0"].to(device, non_blocking=True)
-            shift = batch["shift"].to(device, non_blocking=True)
-            mask = batch["mask"].to(device, non_blocking=True)
-
-            # Conditioning dropout: zero the shift and flag those samples via
-            # cond_mask so the model can distinguish "dropped" from "shift=0".
-            keep = (
-                torch.rand(shift.shape[0], device=shift.device)
-                >= train_config.cond_dropout
-            ).to(shift.dtype)
-            shift = shift * keep
-
+    def losses(
+        self,
+        batch: dict[str, torch.Tensor],
+        decoder: nn.Module | None = None,
+        clean_content: bool | None = None,
+        rng: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """decoder: the module to run (the DDP wrapper in training, the EMA
+        copy in validation). clean_content: force clean (True) or perturbed
+        (False) content for every clip; None mixes by p_clean_content."""
+        decoder = decoder or self.decoder
+        dev = next(self.decoder.parameters()).device
+        b = {k: v.to(dev, non_blocking=True) for k, v in batch.items()}
+        mask = b["mask"]
+        with torch.no_grad():
+            mel_tgt = self.logmel(b["audio"])
+            if clean_content is None:
+                pick = torch.rand(mask.shape[0], device=dev) < self.cfg.p_clean_content
+            else:
+                pick = torch.full((mask.shape[0],), clean_content, device=dev)
+            content_audio = torch.where(pick[:, None], b["audio16"], b["audio16_pert"])
             with torch.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=(device == "cuda")
+                device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"
             ):
-                pred = model(
-                    mel_in,
-                    f0,
-                    shift,
-                    keep,
-                    skip_dropout_p=train_config.skip_dropout,
-                )
-                loss, parts = loss_fn(pred, mel_tgt, mask)
-                if wave_loss_fn is not None:
-                    audio = batch["audio"].to(device, non_blocking=True)
-                    wave = wave_loss_fn(pred, audio)
-                    loss = loss + train_config.w_wave * wave
-                    parts["wave"] = wave.item()
-
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), train_config.grad_clip
-            )
-            opt.step()
-            sched.step()
-            ema.update(model)
-
-            step += 1
-            pbar.update(1)
-
-            if step % train_config.log_every == 0:
-                lr = sched.get_last_lr()[0]
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    l1=f"{parts['l1']:.4f}",
-                    mr=f"{parts['mr']:.4f}",
-                    delta=f"{parts['delta']:.4f}",
-                    wave=f"{parts.get('wave', 0.0):.4f}",
-                    lr=f"{lr:.2e}",
-                )
-                writer.add_scalar("train/loss", loss.item(), step)
-                writer.add_scalar("train/l1", parts["l1"], step)
-                writer.add_scalar("train/mr", parts["mr"], step)
-                writer.add_scalar("train/delta", parts["delta"], step)
-                writer.add_scalar("train/wave", parts.get("wave", 0.0), step)
-                writer.add_scalar("train/lr", lr, step)
-                writer.add_scalar("train/grad_norm", grad_norm.item(), step)
-                if train_config.use_wandb:
-                    wandb.log(
-                        {
-                            "train/loss": loss.item(),
-                            "train/l1": parts["l1"],
-                            "train/mr": parts["mr"],
-                            "train/delta": parts["delta"],
-                            "train/wave": parts.get("wave", 0.0),
-                            "train/lr": lr,
-                            "train/grad_norm": grad_norm.item(),
-                        },
-                        step=step,
-                    )
-
-            if step % train_config.val_every == 0:
-                val_l1 = validate(model, ema, eval_model, val_loader, step, writer)
-                if val_l1 is not None and val_l1 < best_val:
-                    best_val = val_l1
-                    save_ckpt(
-                        model, ema, opt, sched, step, best_val, out_dir / "best.pt"
-                    )
-
-            if step % train_config.save_every == 0:
-                save_ckpt(model, ema, opt, sched, step, best_val)
-
-            if step >= train_config.max_steps:
-                break
-
-    save_ckpt(model, ema, opt, sched, step, best_val, out_dir / "final.pt")
-    pbar.close()
-    writer.close()
-    if train_config.use_wandb:
-        wandb.finish()
+                content = self.content(content_audio).float()
+        with torch.autocast(
+            device_type=dev.type, dtype=torch.bfloat16, enabled=dev.type == "cuda"
+        ):
+            pred = decoder(content, b["f0"], b["uv"], b["loudness"], b["timbre"], mask)
+        pred = pred.float()
+        mel = masked_l1(pred, mel_tgt, mask)
+        loss = self.cfg.w_mel * mel
+        parts = {"mel": mel.item()}
+        if self.cfg.w_stft > 0 or self.cfg.w_wave_mel > 0:
+            wave = self.wave(pred, b["f0"], b["audio"], mask, rng)
+            if wave is not None:
+                stft, wave_mel = wave
+                loss = loss + self.cfg.w_stft * stft + self.cfg.w_wave_mel * wave_mel
+                parts |= {"stft": stft.item(), "wave_mel": wave_mel.item()}
+        parts["loss"] = loss.item()
+        return loss, parts
 
 
-@torch.no_grad()
-def validate(model, ema, eval_model, loader, step, writer):
-    # Validate with EMA weights — reuse a single eval_model instead of
-    # deep-copying `model` each call.
-    ema.copy_to(eval_model)
-    eval_model.eval()
+def lr_lambda(cfg: TrainConfig):
+    def f(step: int) -> float:
+        if step < cfg.warmup_steps:
+            return step / max(1, cfg.warmup_steps)
+        progress = (step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
+        return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
-    total, n = 0.0, 0
-    for batch in loader:
-        mel_in = batch["mel_in"].to(device)
-        mel_tgt = batch["mel_tgt"].to(device)
-        f0 = batch["f0"].to(device)
-        shift = batch["shift"].to(device)
-        mask = batch["mask"].to(device)
-        cond_mask = torch.ones_like(shift)
-        pred = eval_model(mel_in, f0, shift, cond_mask)
-        total += ((pred - mel_tgt).abs() * mask).sum().item()
-        n += mask.sum().item() * mel_tgt.size(-2)
-    if n == 0:
-        print(f"\n[val step {step}] empty val set — skipping")
-        return None
-    else:
-        val_l1 = total / n
-        print(f"\n[val step {step}] L1={val_l1:.4f}")
-        writer.add_scalar("val/l1", val_l1, step)
-        if train_config.use_wandb:
-            wandb.log({"val/l1": val_l1}, step=step)
-        return val_l1
+    return f
 
 
-_STEP_CKPT_RE = re.compile(r"^step_(\d+)\.pt$")
+def setup_distributed(requested: str) -> tuple[int, int, torch.device]:
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world > 1:
+        local = int(os.environ["LOCAL_RANK"])
+        if torch.cuda.is_available() and requested in ("auto", "cuda"):
+            torch.cuda.set_device(local)
+            dist.init_process_group("nccl")
+            return dist.get_rank(), world, torch.device("cuda", local)
+        dist.init_process_group("gloo")
+        return dist.get_rank(), world, torch.device("cpu")
+    if requested != "auto":
+        return 0, 1, torch.device(requested)
+    if torch.cuda.is_available():
+        return 0, 1, torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return 0, 1, torch.device("mps")
+    return 0, 1, torch.device("cpu")
 
 
-def _step_ckpts(ckpt_dir: Path):
-    out = []
-    for p in ckpt_dir.glob("step_*.pt"):
-        m = _STEP_CKPT_RE.match(p.name)
-        if m:
-            out.append((int(m.group(1)), p))
-    out.sort(key=lambda x: x[0])
-    return out
+_STEP_RE = re.compile(r"^step_(\d+)\.pt$")
 
 
-def save_ckpt(model, ema, opt, sched, step, best_val, path=None):
-    # path=None writes a rolling step checkpoint; best.pt and final.pt pass one.
-    rolling = path is None
-    if rolling:
-        ckpt_dir = Path(train_config.ckpt_dir)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
-        path = ckpt_dir / f"step_{step}.pt"
+def step_ckpts(ckpt_dir: Path) -> list[tuple[int, Path]]:
+    found = [
+        (int(m.group(1)), p)
+        for p in ckpt_dir.glob("step_*.pt")
+        if (m := _STEP_RE.match(p.name))
+    ]
+    return sorted(found)
+
+
+def save_ckpt(
+    path: Path, stage: Stage1, ema: EMA, opt, sched, step: int, best_val: float
+):
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(
         {
-            "model": model.state_dict(),
+            "decoder": stage.decoder.state_dict(),
+            "ema": {"shadow": ema.shadow, "step": ema.step},
             "opt": opt.state_dict(),
             "sched": sched.state_dict(),
-            "ema": {"shadow": ema.shadow, "step": ema.step},
             "step": step,
             "best_val": best_val,
+            "model_config": asdict(stage.decoder.cfg),
+            "frontend_config": asdict(FrontendConfig()),
+            "train_config": asdict(stage.cfg),
         },
         tmp,
     )
     os.replace(tmp, path)
 
-    if rolling:
-        # Prune oldest step_*.pt so at most `keep_last` remain.
-        ckpts = _step_ckpts(ckpt_dir)
-        for _, old in ckpts[: -train_config.keep_last]:
-            old.unlink(missing_ok=True)
+
+@torch.no_grad()
+def validate(
+    stage: Stage1, ema: EMA, eval_decoder: nn.Module, loader, step: int, writer
+) -> float:
+    """EMA weights, fixed crop positions. Reports the mel L1 with clean
+    content (the unshifted inference case) and with perturbed content (pitch
+    from the F0 track only); their mean picks best.pt."""
+    ema.copy_to(eval_decoder)
+    eval_decoder.eval()
+    sums: dict[str, float] = {}
+    n = 0
+    rng = torch.Generator().manual_seed(0)
+    for i, batch in enumerate(loader):
+        if i >= stage.cfg.val_batches:
+            break
+        for name, clean in (("clean", True), ("pert", False)):
+            _, parts = stage.losses(batch, eval_decoder, clean_content=clean, rng=rng)
+            for k, v in parts.items():
+                sums[f"{k}_{name}"] = sums.get(f"{k}_{name}", 0.0) + v
+        n += 1
+    if n == 0:
+        return math.inf
+    means = {k: v / n for k, v in sums.items()}
+    for k, v in means.items():
+        writer.add_scalar(f"val/{k}", v, step)
+    score = 0.5 * (means["mel_clean"] + means["mel_pert"])
+    print(
+        f"\n[val step {step}] mel L1 clean {means['mel_clean']:.4f}, "
+        f"perturbed {means['mel_pert']:.4f}"
+        + (f", stft {means['stft_pert']:.4f}" if "stft_pert" in means else "")
+    )
+    return score
 
 
-def load_latest(ckpt_dir: Path):
-    final = out_dir / "final.pt"
-    if final.exists():
-        print(
-            f"{final} exists — training already complete. "
-            "Delete it to start a new run.",
-            file=sys.stderr,
-        )
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(
+        description="Resung stage 1: decoder vs the frozen vocoder."
+    )
+    for name in (
+        "max_steps",
+        "val_every",
+        "save_every",
+        "batch_size",
+        "num_workers",
+        "log_every",
+    ):
+        p.add_argument("--" + name.replace("_", "-"), type=int, default=None)
+    p.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("stage1"),
+        help="best.pt, final.pt, checkpoints/ and runs/ go here (the repo root keeps the baseline's)",
+    )
+    p.add_argument("--cache-dir", type=Path, default=None)
+    p.add_argument(
+        "--datasets", nargs="+", help="subset of DataConfig.datasets_to_load"
+    )
+    p.add_argument("--device", default="auto", help="auto | cuda | mps | cpu")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--price-per-hour", type=float, default=None, help="for the cost projection"
+    )
+    p.add_argument(
+        "--project-steps",
+        type=int,
+        default=None,
+        help="steps to project the run time for (default: TrainConfig.max_steps)",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    cfg = TrainConfig()
+    for name in (
+        "max_steps",
+        "val_every",
+        "save_every",
+        "batch_size",
+        "num_workers",
+        "log_every",
+    ):
+        if getattr(args, name) is not None:
+            setattr(cfg, name, getattr(args, name))
+    project_steps = args.project_steps or TrainConfig().max_steps
+    rank, world, device = setup_distributed(args.device)
+    main_proc = rank == 0
+    torch.manual_seed(args.seed + rank)
+
+    out_dir = args.out_dir
+    ckpt_dir = out_dir / cfg.ckpt_dir
+    if (out_dir / "final.pt").exists():
+        if main_proc:
+            print(
+                f"{out_dir / 'final.pt'} exists: training is complete. Delete it to start a new run."
+            )
         sys.exit(0)
-    if not ckpt_dir.exists():
-        return None
-    ckpts = _step_ckpts(ckpt_dir)
-    if not ckpts:
-        return None
-    _, path = ckpts[-1]
-    print(f"loading {path}")
-    return torch.load(path, map_location=device, weights_only=False)
+    # One rank downloads the vocoder; the others wait for it.
+    if main_proc:
+        checkpoint_path()
+    if world > 1:
+        dist.barrier()
+
+    stage = Stage1(cfg, device)
+    eval_decoder = ResungDecoder(stage.decoder.cfg).to(device)
+    if main_proc:
+        print(
+            f"decoder: {count_params(stage.decoder) / 1e6:.2f} M params, device {device}, world {world}"
+        )
+    decoder: nn.Module = stage.decoder
+    if world > 1:
+        decoder = DDP(
+            stage.decoder, device_ids=[device.index] if device.type == "cuda" else None
+        )
+
+    opt = torch.optim.AdamW(
+        stage.decoder.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+        betas=cfg.betas,
+    )
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda(cfg))
+    ema = EMA(stage.decoder, cfg.ema_decay)
+
+    step, best_val = 0, math.inf
+    ckpts = step_ckpts(ckpt_dir) if ckpt_dir.exists() else []
+    if ckpts:
+        ck = torch.load(ckpts[-1][1], map_location=device, weights_only=False)
+        stage.decoder.load_state_dict(ck["decoder"])
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        ema.shadow, ema.step = ck["ema"]["shadow"], ck["ema"]["step"]
+        step, best_val = ck["step"], ck["best_val"]
+        if main_proc:
+            print(f"resumed from {ckpts[-1][1]} (step {step})")
+
+    data_kwargs = {}
+    if args.cache_dir:
+        data_kwargs["cache_dir"] = args.cache_dir
+    if args.datasets:
+        data_kwargs["dataset_keys"] = args.datasets
+    train_loader = ResungDataset.make_loader(
+        "train",
+        cfg.batch_size,
+        cfg.num_workers,
+        rank=rank,
+        world_size=world,
+        seed=args.seed + step,
+        **data_kwargs,
+    )
+    val_loader = (
+        ResungDataset.make_loader("val", cfg.batch_size, cfg.num_workers, **data_kwargs)
+        if main_proc
+        else None
+    )
+    writer = SummaryWriter(log_dir=str(out_dir / cfg.tb_dir)) if main_proc else None
+    if main_proc:
+        assert val_loader is not None
+        print(
+            f"{len(train_loader.dataset)} train / {len(val_loader.dataset)} val segments "
+            f"({', '.join(args.datasets or DataConfig().datasets_to_load)}), "
+            f"global batch {cfg.batch_size * world}, "
+            f"{cfg.max_steps} steps"
+        )
+
+    timer_start, timer_step = None, None
+    decoder.train()
+    while step < cfg.max_steps:
+        for batch in train_loader:
+            loss, parts = stage.losses(batch, decoder)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                stage.decoder.parameters(), cfg.grad_clip
+            )
+            opt.step()
+            sched.step()
+            ema.update(stage.decoder)
+            step += 1
+
+            # Speed, measured after a warm-up of 10 steps.
+            if step == 10:
+                timer_start, timer_step = time.perf_counter(), step
+            report = (
+                main_proc
+                and timer_start is not None
+                and step > timer_step
+                and (step in (60, 1000) or step == cfg.max_steps)
+            )
+            if report:
+                its = (step - timer_step) / (time.perf_counter() - timer_start)
+                hours = project_steps / its / 3600
+                cost = (
+                    f", about ${hours * args.price_per_hour:.0f}"
+                    if args.price_per_hour
+                    else ""
+                )
+                print(
+                    f"\n[speed] {its:.2f} it/s at global batch {cfg.batch_size * world}: "
+                    f"{project_steps} steps would take {hours:.1f} h{cost} (training only)"
+                )
+                assert writer is not None
+                writer.add_scalar("speed/it_per_s", its, step)
+
+            if main_proc and step % cfg.log_every == 0:
+                assert writer is not None
+                lr = sched.get_last_lr()[0]
+                for k, v in parts.items():
+                    writer.add_scalar(f"train/{k}", v, step)
+                writer.add_scalar("train/lr", lr, step)
+                writer.add_scalar("train/grad_norm", float(grad_norm), step)
+                msg = " ".join(f"{k} {v:.4f}" for k, v in parts.items())
+                print(f"step {step} {msg} lr {lr:.2e}", flush=True)
+
+            if step % cfg.val_every == 0 or step == cfg.max_steps:
+                if main_proc:
+                    assert val_loader is not None and writer is not None
+                    score = validate(stage, ema, eval_decoder, val_loader, step, writer)
+                    if score < best_val:
+                        best_val = score
+                        save_ckpt(
+                            out_dir / "best.pt", stage, ema, opt, sched, step, best_val
+                        )
+                decoder.train()
+                if world > 1:
+                    dist.barrier()
+
+            if main_proc and step % cfg.save_every == 0:
+                save_ckpt(
+                    ckpt_dir / f"step_{step}.pt", stage, ema, opt, sched, step, best_val
+                )
+                for _, old in step_ckpts(ckpt_dir)[: -cfg.keep_last]:
+                    old.unlink(missing_ok=True)
+
+            if step >= cfg.max_steps:
+                break
+
+    if main_proc:
+        save_ckpt(out_dir / "final.pt", stage, ema, opt, sched, step, best_val)
+        assert writer is not None
+        writer.close()
+    if world > 1:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

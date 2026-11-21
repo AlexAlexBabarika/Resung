@@ -136,37 +136,62 @@ class DataConfig:
 
 @dataclass
 class TrainConfig:
-    perturb_st: int = 6
-    batch_size: int = 32
+    # Stage 1: the decoder against the frozen PC-NSF-HiFiGAN. Batch size is
+    # per GPU; under torchrun the global batch is batch_size * world size.
+    batch_size: int = 16
     num_workers: int = 6
-    warmup_steps: int = 1000
+    warmup_steps: int = 2000
     max_steps: int = 60000
     lr: float = 2.0e-4
     weight_decay: float = 0.01
     betas = (0.8, 0.99)
     grad_clip: float = 1.0
     ema_decay: float = 0.9999
-    cond_dropout: float = 0.0
-    skip_dropout: float = 0.0
+    # Share of clips whose content comes from the clean audio, as at
+    # inference, rather than from the WORLD-shifted copy.
+    p_clean_content: float = 0.2
+    w_mel: float = 1.0
+    # Waveform terms through the frozen vocoder, on a crop of wave_frames
+    # frames from wave_batch clips: multi-resolution STFT and the vocoder's
+    # own mel of the output. w_stft = w_wave_mel = 0 turns them off.
+    w_stft: float = 1.0
+    w_wave_mel: float = 1.0
+    wave_batch: int = 8
+    wave_frames: int = 64
     log_every: int = 100
     val_every: int = 2000
+    val_batches: int = 50
     save_every: int = 2000
     keep_last: int = 5
     ckpt_dir: str = "./checkpoints"
     tb_dir: str = "./runs"
-    # Waveform loss through the frozen vocoder; w_wave = 0 turns it off.
-    w_wave: float = 0.5
-    wave_batch: int = 8
-    wave_frames: int = 64
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    # Resung's decoder: conv + self-attention blocks over the vocoder's frames,
+    # with the timbre embedding entering every block through adaptive norms.
+    content_dim: int = 768  # ContentVec layer 12
+    content_bottleneck: int = 256
+    dim: int = 384
+    layers: int = 10
+    heads: int = 6
+    ff_mult: int = 4
+    conv_kernel: int = 15
+    cond_dim: int = 256
+    f0_fourier: int = 16  # sin/cos pairs of log-F0
+    dropout: float = 0.1
+
+
+@dataclass(frozen=True)
+class BaselineConfig:
+    # The predecessor's WORLD + PitchUNet engine, kept as the baseline.
     vocoder_repo: str = "nvidia/bigvgan_base_22khz_80band"
-    use_wandb: bool = False
-    wandb_project: str = "pitch-shifter"
-    wandb_run_name: str | None = None
-    wandb_run_id: str | None = None
+    perturb_st: int = 6
 
 
 @dataclass
-class ModelConfig:
+class PitchUNetConfig:
     base_channels: int = 64
     channel_mults = [1, 2, 4, 6]  # 64, 128, 256, 384
     shift_emb_dim: int = 64
