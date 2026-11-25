@@ -52,6 +52,15 @@ vocoder. A fifth of the clips use clean content, as inference does.
 synthesis, its own pitch shift); `scripts/listen_stage1.py` renders a trained
 checkpoint's reconstructions and shifts next to the vocoder's own shift.
 
+`scripts/voice_check.py` measures whether the output still sounds like the
+singer, with a speaker-verification model the decoder was not trained on
+(`speaker_similarity.py`, WavLM-base-plus-sv). It takes audio files, so it runs
+without the training cache: per voice it scores the vocoder alone, the decoder
+at the original pitch, the decoder with another voice's timbre embedding, and
+shifts next to Rubber Band, against the same voice on other audio and against
+other voices. `--backing` mixes each clean voice into an instrumental and
+separates it again first.
+
 ## Current pipeline (inherited)
 
 A pitch shifter for songs. It separates stems with Demucs and, by default,
@@ -146,6 +155,8 @@ the U-Net sees it, so the formants follow a little, as a real voice's do.
 | `losses.py` | Mel L1, and the STFT and vocoder-mel losses through the frozen vocoder |
 | `train.py` | Stage 1: one device or `torchrun` across GPUs, EMA, checkpoints, TensorBoard, speed and cost projection |
 | `scripts/vocoder_check.py`, `scripts/listen_stage1.py` | Vocoder check; listening and pitch check of a trained checkpoint |
+| `speaker_similarity.py` | Speaker similarity for evaluation (WavLM-base-plus-sv, not the conditioning model) |
+| `scripts/voice_check.py` | Does the output keep the singer? Similarity per system on any audio files |
 | `scripts/vast.sh` | Rented-GPU workflow: setup, data, smoke, train, listen |
 | `pitch_unet.py` | Baseline only: the predecessor's `PitchUNet` |
 | `inference.py` | CLI entrypoint: separate → shift → remix |

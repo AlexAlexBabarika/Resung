@@ -27,6 +27,7 @@ eval_results.json
 vocoder_check/
 listen_stage1/
 listen_stage1.log
+voice_check/
 example.wav
 *_stems/
 
