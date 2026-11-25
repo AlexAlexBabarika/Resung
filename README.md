@@ -3,22 +3,27 @@
 Song pitch shifting that aims to sound as if the singer re-sang the song in the
 new key and the band retuned their instruments.
 
-**Status: in development.** Resung succeeds
+**Status: stopped after stage 1, as a negative result (November 2026).** Resung
+was built to succeed
 [SelfSupervised-Pitch-Shifter](https://github.com/AlexAlexBabarika/SelfSupervised-Pitch-Shifter),
 which moved the pitch with WORLD and cleaned the result with a U-Net. Listening
 tests traced that model's robotic sound to WORLD's pitch change itself, so Resung
-replaces the WORLD front end on the vocals. In the planned design a frozen
-ContentVec encoder captures what is sung, RMVPE tracks the pitch, and a decoder
-with an NSF-HiFiGAN vocoder generates the voice at the new pitch. It is trained
-self-supervised, with an adversarial loss. Instruments stay on Signalsmith Stretch
-and drums stay untouched.
+replaces the WORLD front end on the vocals: a frozen ContentVec encoder captures
+what is sung, RMVPE tracks the pitch, and a decoder with an NSF-HiFiGAN vocoder
+generates the voice at the new pitch. Training is self-supervised. Instruments
+stay on Signalsmith Stretch and drums stay untouched.
 
-Built so far: the 44.1 kHz front end and training cache (`frontend/`, `data.py`,
-`Process_HF_Datasets.py`), the decoder (`model.py`) and stage-1 training against
-the frozen vocoder (`train.py`). The adversarial stage, which also fine-tunes the
-vocoder, and the new inference path come next. Until Resung beats its predecessor in `evaluate.py`
-and a blind listening test, inference runs on the inherited pipeline described
-below, which serves as the baseline.
+Stage 1 moved the pitch of a real song accurately. But on vocals from commercial
+songs the output no longer sounds like the singer, and the vocoder alone already
+sounds robotic on them. [What stage 1 showed](#what-stage-1-showed) has the
+measurements. The planned adversarial stage, which would also have fine-tuned the
+vocoder, was not built.
+
+Built: the 44.1 kHz front end and training cache (`frontend/`, `data.py`,
+`Process_HF_Datasets.py`), the decoder (`model.py`), stage-1 training against the
+frozen vocoder (`train.py`), the vocal engine (`inference/resung.py`) and the
+checks below. Resung was never scored in `evaluate.py` or in a blind test, so
+inference runs on the inherited pipeline described further down.
 
 ## Front end
 
@@ -61,6 +66,60 @@ shifts next to Rubber Band, against the same voice on other audio and against
 other voices. `--backing` mixes each clean voice into an instrumental and
 separates it again first.
 
+## What stage 1 showed
+
+Stage 1 trained to step 46,900 of 60,000 and was stopped when the held-out loss
+levelled off. Everything below uses the step-46,000 checkpoint.
+
+**Pitch.** On one commercial song, shifted by +6, -2 and -6 semitones, the median
+pitch error of the shifted vocal was 3.5, 3.7 and 4.1 cents, with about 95% of
+frames within 50 cents.
+
+**Voice.** `scripts/voice_check.py`, on 15-second excerpts, decoder at the
+original pitch. Scores are speaker-similarity cosines to the original excerpt.
+For scale, the same singer on other audio scores about 0.93 and a different
+singer 0.60 to 0.73.
+
+| Voices | Vocoder alone | Decoder |
+|---|---|---|
+| Clean, trained on (4 GTSinger singers) | 0.99 | 0.96 |
+| Clean, never heard (1 GTSinger and 6 OpenSinger singers) | 0.98 | 0.97 |
+| Vocals separated from 3 commercial songs, 12 excerpts | 0.94 | 0.82 (0.62 to 0.92) |
+
+- The voice is lost before any shift: on the song vocals the drop is there at the
+  original pitch.
+- Clean voices keep their identity, including singers the decoder never heard.
+  Shifted by 6 semitones they score 0.91 to 0.93 with Resung, against 0.79 to 0.88
+  with Rubber Band.
+- The decoder uses the timbre embedding. With another clean voice's embedding,
+  similarity to the original falls from 0.96 to 0.81 and similarity to the donor
+  rises from 0.49 to 0.70.
+- Simple processing of a clean voice does not reproduce the loss. Mixing it into
+  an instrumental and separating it again with Demucs, a plate reverb, a double
+  and a harmony each cost 0.05 or less. What it is about produced vocals is not
+  established.
+
+**By ear** (one listener, not blind, unshifted excerpts of the three songs). The
+original voice could not be recognised in the decoder's output. The vocoder's
+output kept the voice more or less, but it broke up and sounded robotic, like a
+badly made auto-tune effect. The similarity score gave those vocoder outputs 0.82
+to 0.99, so it does not register this and cannot be the only measure.
+
+**Pitch track.** On one of the songs RMVPE's track jumped by more than 4
+semitones 15 to 64 times in a 15-second excerpt, against 0 or 1 on clean voices.
+A continuous path through RMVPE's salience removed the jumps, but by ear it
+changed the voice and the robotic sound stayed, so it was not adopted. This was
+measured with throwaway scripts that are not in the repository.
+
+**Why it stopped here.** The vocoder alone is the best the decoder can do, and on
+produced vocals it already fails by ear. More decoder training or data would not
+get past that. Whether fine-tuning the vocoder in the adversarial stage would
+have helped was not tested.
+
+Limits: one listener; three songs; one scoring model; the song excerpts are
+commercial recordings and are not in the repository, so only the clean-voice rows
+can be reproduced from it.
+
 ## Current pipeline (inherited)
 
 A pitch shifter for songs. It separates stems with Demucs and, by default,
@@ -78,9 +137,10 @@ the shift size picks one: Rubber Band up to 3 semitones, the model above that
   clean mel-spectrogram of the shifted signal, and a BigVGAN vocoder resynthesizes
   the audio. It needs a trained checkpoint
   ([weights on Hugging Face](https://huggingface.co/AlexAlexBabarika/SelfSupervised-Pitch-Shifter)).
-  At 6 semitones it is ahead of Rubber Band on the envelope and round-trip measures
-  and was preferred in a small blind listening test, but large shifts still sound
-  somewhat robotic.
+  At 6 semitones it was preferred over Rubber Band in a small blind listening test,
+  but large shifts still sound somewhat robotic. It also scores ahead at 6 semitones
+  on the envelope and round-trip measures, but mostly in a band the test clips can't
+  give Rubber Band; below 6 kHz Rubber Band is ahead.
 
 ### How the model engine works
 
@@ -271,9 +331,8 @@ NSynth is still defined but no longer loaded. Checkpoints land in `stage1/checkp
 
 ## Evaluation
 
-`evaluate.py` still reads the predecessor's 22.05 kHz cache and is being ported
-to the new one, with Resung, the vocoder's own shift and speaker similarity added as
-systems. As it stands:
+`evaluate.py` still reads the predecessor's 22.05 kHz cache. It was not ported to
+the new one, so it scores the baseline only:
 
 ```bash
 uv run evaluate.py            # uses ./best.pt (the baseline) and the held-out validation clips
